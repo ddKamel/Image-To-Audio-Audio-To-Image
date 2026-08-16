@@ -1,0 +1,6 @@
+numpy
+librosa
+soundfile
+pillow
+streamlit
+streamlit-drawable-canvas-fix
