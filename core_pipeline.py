@@ -20,6 +20,7 @@ import numpy as np
 from PIL import Image
 import librosa
 import soundfile as sf
+from scipy.signal import butter, filtfilt
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +298,45 @@ def synthesize_sine_wave(
         audio[-fade_samples:] *= fade_curve[::-1]
 
     return audio.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Audio effects (for the "edit the sound, see the resulting image" workflow)
+# ---------------------------------------------------------------------------
+
+def apply_filter(
+    audio: np.ndarray,
+    sr: int,
+    filter_type: str = "lowpass",
+    cutoff_hz: float = 2000.0,
+    order: int = 4,
+) -> np.ndarray:
+    """
+    Applies a lowpass or highpass Butterworth filter to an audio signal.
+    Useful to see how removing high or low frequency content changes the
+    resulting spectrogram image (e.g. a lowpass filter should visibly cut
+    off the top part of the image).
+    """
+    nyquist = sr / 2.0
+    normalized_cutoff = min(max(cutoff_hz / nyquist, 1e-4), 0.999)
+    b, a = butter(order, normalized_cutoff, btype=filter_type)
+    filtered = filtfilt(b, a, audio)
+    return filtered.astype(np.float32)
+
+
+def apply_distortion(audio: np.ndarray, drive: float = 5.0) -> np.ndarray:
+    """
+    Applies a simple tanh-based soft-clipping distortion. Higher `drive`
+    pushes the signal harder into the nonlinearity, adding more harmonics -
+    visible in the resulting spectrogram as new energy above the original
+    frequencies that weren't there before.
+    """
+    driven = audio * drive
+    distorted = np.tanh(driven)
+    peak = np.max(np.abs(distorted))
+    if peak > 1e-8:
+        distorted = distorted / peak * 0.95
+    return distorted.astype(np.float32)
 
 
 if __name__ == "__main__":

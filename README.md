@@ -15,7 +15,20 @@ To run it on your local browser run it with Streamlit
 
 A demo can be found here:
 
-ADD LINK
+https://image-to-audio-audio-to-image-bjonftzuytan7x2pnglvaf.streamlit.app/
+
+## Functionality
+Image-to-Audio: We can upload any image and "hear" what it kind of sounds like. If we just treat the pixel values as amplitude we can code them into sounds.
+There we can tweak different settings and see how they actually change the sound. (see tooltips)
+There are two options for using already prefabricated images: One with a single tone and one with harmonics.
+
+Audio-to-Image: The other way around. We can upload any audio and see what it looks like.
+There is also an option to choose a certain piano note and its octave and generate an image out of that.
+Additionally, there is an option to apply a lowpass, highpass filter and distortion to add some variation to these notes.
+
+Paint-Spectrogram: We can also paint with a simple brush tool and an eraser.
+There is also an option to add a harmonic stack with overtones already added.
+
 
 ## How does it work?
 
@@ -71,7 +84,7 @@ To be as accurate as possible we could always save some original information lik
 
 To make everything as smooth and as easily runable as possible we use the libraries librosa (for stft and algorithms) as well as streamlit for the webhosting.
 Pillow and soundfile give us some useful helper functions.
-The drawable canvas is made using the streamlit-drawable-canvas-fix library.
+The drawable canvas is made using the streamlit-image-coordinates and scipy library.
 
 ## Mentions
 

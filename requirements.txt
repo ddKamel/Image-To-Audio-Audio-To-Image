@@ -3,4 +3,5 @@ librosa
 soundfile
 pillow
 streamlit
-streamlit-drawable-canvas-fix
+scipy
+streamlit-image-coordinates

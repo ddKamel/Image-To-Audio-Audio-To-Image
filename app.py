@@ -6,16 +6,21 @@ Streamlit UI for the Image-to-Sound / Sound-to-Image project.
 Run with:
     streamlit run app.py
 
-Two tabs keep the two directions of the pipeline separate:
+Three tabs:
 - "Image -> Audio": turn an image into audio (image treated as spectrogram)
-- "Audio -> Image": turn audio into an image (compute its spectrogram)
+- "Audio -> Image": turn audio into an image (compute its spectrogram),
+  optionally applying an audio effect first to see how it changes the image
+- "Paint Spectrogram": draw a spectrogram by hand and hear it
 """
 
 import os
 import tempfile
 
+import numpy as np
+import librosa
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 from core_pipeline import (
     image_to_audio,
@@ -25,11 +30,9 @@ from core_pipeline import (
     make_test_image_harmonic_stack,
     synthesize_sine_wave,
     note_name_to_frequency,
+    apply_filter,
+    apply_distortion,
 )
-
-import numpy as np
-from streamlit_drawable_canvas import st_canvas
-
 
 st.set_page_config(page_title="Image to Sound", layout="centered")
 
@@ -57,6 +60,23 @@ def make_display_thumbnail(src_path: str) -> str:
     img = img.resize(DISPLAY_SIZE)
     img.save(thumb_path)
     return thumb_path
+
+
+def show_round_trip_comparison(original_image_path: str, reconstructed_audio_path: str, n_fft: int):
+    """
+    Computes the spectrogram of the just-reconstructed audio and shows it
+    next to the original input image, so information loss/artifacts from
+    Griffin-Lim + quantization + resizing become visible, not just audible.
+    """
+    round_trip_image_path = os.path.join(tmp_dir, "round_trip.png")
+    audio_to_image(reconstructed_audio_path, round_trip_image_path, n_fft=n_fft, sr=SAMPLE_RATE)
+
+    st.write("**Round-trip comparison** (original image vs. spectrogram of the audio you just heard):")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.image(make_display_thumbnail(original_image_path), caption="Original image")
+    with col_b:
+        st.image(make_display_thumbnail(round_trip_image_path), caption="Spectrogram of reconstructed audio")
 
 
 # Log-spaced preset points (in seconds) for the quick-pick duration slider.
@@ -101,12 +121,18 @@ def duration_control(key_prefix: str, default_sec: float = 3.0) -> float:
     current = st.session_state[master_key]
     nearest_preset = min(_DURATION_PRESETS, key=lambda p: abs(p - current))
 
+    # Streamlit does not allow passing `value=` for a widget whose key is
+    # already present in session_state (it doesn't know which should win).
+    # So we only seed the initial value on the very first run for each key;
+    # after that, the widget reads its value from session_state via `key`.
+    slider_kwargs = {} if slider_key in st.session_state else {"value": nearest_preset}
+    input_kwargs = {} if input_key in st.session_state else {"value": current}
+
     col_slider, col_input = st.columns([2, 1])
     with col_slider:
         st.select_slider(
             "Duration (log scale, quick pick)",
             options=_DURATION_PRESETS,
-            value=nearest_preset,
             format_func=_format_duration,
             key=slider_key,
             on_change=_on_slider_change,
@@ -117,6 +143,7 @@ def duration_control(key_prefix: str, default_sec: float = 3.0) -> float:
                 "if you need a specific number of seconds, e.g. to match "
                 "an uploaded song's length."
             ),
+            **slider_kwargs,
         )
     with col_input:
         st.number_input(
@@ -124,9 +151,9 @@ def duration_control(key_prefix: str, default_sec: float = 3.0) -> float:
             min_value=1.0,
             max_value=600.0,
             step=1.0,
-            value=float(st.session_state[input_key]) if input_key in st.session_state else current,
             key=input_key,
             on_change=_on_input_change,
+            **input_kwargs,
         )
 
     return st.session_state[master_key]
@@ -135,7 +162,6 @@ def duration_control(key_prefix: str, default_sec: float = 3.0) -> float:
 tab_img_to_audio, tab_audio_to_img, tab_paint = st.tabs(
     ["Image \u2192 Audio", "Audio \u2192 Image", "Paint Spectrogram"]
 )
-
 
 # =============================================================================
 # TAB 1: Image -> Audio
@@ -152,9 +178,8 @@ with tab_img_to_audio:
                 "Number of frequency bins the image is stretched to vertically. "
                 "Higher = finer frequency detail but coarser timing per frame; "
                 "lower = the opposite. "
-                "Example: a thin horizontal line becomes a purer, narrower tone "
-                "at n_fft=4096 than at n_fft=512, where nearby frequencies blur "
-                "together."
+                ""
+                "With the standard set Sample Rate of 22050 Hz an FFT size of 2048 is optimal "
             ),
             key="i2a_nfft",
         )
@@ -165,8 +190,9 @@ with tab_img_to_audio:
             help=(
                 "Maps pixel brightness to loudness: black = -db_range dB (quiet), "
                 "white = 0 dB (loudest). "
-                "Example: a small value (20 dB) makes even dark image areas "
-                "audible, giving a fuller/noisier sound; a large value (120 dB) "
+                " "
+                "Example: a small value makes dark image areas "
+                "audible, giving a fuller/noisier sound; a large value"
                 "silences dark areas, making the sound cleaner and more selective."
             ),
             key="i2a_db",
@@ -176,7 +202,8 @@ with tab_img_to_audio:
             4, 64, 32, step=4,
             help=(
                 "How many iterations are used to estimate the missing phase "
-                "information (the image only encodes magnitude, not phase). "
+                "information using Griffin-Lim."
+                " "
                 "Example: 4 iterations reconstruct quickly but sound metallic/"
                 "noisy; 32-64 iterations sound cleaner but take longer to compute."
             ),
@@ -238,9 +265,10 @@ with tab_img_to_audio:
                 st.download_button(
                     "Download .wav", f, file_name="reconstructed.wav", key="i2a_download"
                 )
+
+            show_round_trip_comparison(image_path, out_audio_path, n_fft)
     else:
         st.info("Please upload an image or select a test image to get started.")
-
 
 # =============================================================================
 # TAB 2: Audio -> Image
@@ -346,37 +374,170 @@ with tab_audio_to_img:
                 f.write(uploaded_audio.getbuffer())
 
     if audio_path is not None:
+        st.write("Original audio:")
         st.audio(audio_path)
+
+        st.subheader("Effects (optional)")
+        st.caption("Apply an effect to the audio and see how it changes the spectrogram image.")
+
+        apply_filter_enabled = st.checkbox("Apply filter", key="a2i_filter_enabled")
+        if apply_filter_enabled:
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                filter_type = st.radio(
+                    "Filter type", ["lowpass", "highpass"], horizontal=True, key="a2i_filter_type"
+                )
+            with fcol2:
+                cutoff_hz = st.slider(
+                    "Cutoff frequency (Hz)", 50, 10000, 2000, step=50, key="a2i_filter_cutoff",
+                    help=(
+                        "Lowpass keeps frequencies below this and removes everything "
+                        "above - the image should look cut off/dark above this "
+                        "frequency's row. Highpass does the opposite."
+                    ),
+                )
+
+        apply_distortion_enabled = st.checkbox("Apply distortion", key="a2i_distortion_enabled")
+        if apply_distortion_enabled:
+            drive = st.slider(
+                "Drive", 1.0, 20.0, 5.0, step=0.5, key="a2i_distortion_drive",
+                help=(
+                    "How hard the signal is pushed into the clipping curve. "
+                    "Higher values add more new harmonic content - expect new "
+                    "energy to appear above the original frequencies in the image."
+                ),
+            )
+
+        effects_active = apply_filter_enabled or apply_distortion_enabled
 
         if st.button("Generate Image", type="primary", key="a2i_generate"):
             with st.spinner("Computing spectrogram..."):
                 out_image_path = os.path.join(tmp_dir, "spectrogram.png")
                 audio_to_image(audio_path, out_image_path, n_fft=n_fft2, db_range=db_range2, sr=SAMPLE_RATE)
 
+                processed_audio_path = None
+                processed_image_path = None
+                if effects_active:
+                    processed_audio, sr_loaded = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
+                    if apply_filter_enabled:
+                        processed_audio = apply_filter(
+                            processed_audio, SAMPLE_RATE, filter_type=filter_type, cutoff_hz=cutoff_hz
+                        )
+                    if apply_distortion_enabled:
+                        processed_audio = apply_distortion(processed_audio, drive=drive)
+
+                    processed_audio_path = os.path.join(tmp_dir, "processed_audio.wav")
+                    save_audio(processed_audio, SAMPLE_RATE, processed_audio_path)
+
+                    processed_image_path = os.path.join(tmp_dir, "processed_spectrogram.png")
+                    audio_to_image(
+                        processed_audio_path, processed_image_path, n_fft=n_fft2, db_range=db_range2, sr=SAMPLE_RATE
+                    )
+
             st.success("Done")
-            st.image(
-                make_display_thumbnail(out_image_path),
-                caption="Resulting spectrogram image",
-            )
-            with open(out_image_path, "rb") as f:
-                st.download_button(
-                    "Download full-resolution image (.png)",
-                    f,
-                    file_name="spectrogram.png",
-                    key="a2i_download",
+
+            if effects_active:
+                st.write("With effects applied:")
+                st.audio(processed_audio_path)
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.image(make_display_thumbnail(out_image_path), caption="Original")
+                with col_b:
+                    st.image(make_display_thumbnail(processed_image_path), caption="With effects")
+                with open(processed_image_path, "rb") as f:
+                    st.download_button(
+                        "Download full-resolution image with effects (.png)",
+                        f,
+                        file_name="spectrogram_with_effects.png",
+                        key="a2i_download_processed",
+                    )
+            else:
+                st.image(
+                    make_display_thumbnail(out_image_path),
+                    caption="Resulting spectrogram image",
                 )
+                with open(out_image_path, "rb") as f:
+                    st.download_button(
+                        "Download full-resolution image (.png)",
+                        f,
+                        file_name="spectrogram.png",
+                        key="a2i_download",
+                    )
     else:
         st.info("Please select a note or upload an audio file to get started.")
-
 
 # =============================================================================
 # TAB 3: Paint Spectrogram
 # =============================================================================
+CANVAS_WIDTH = 500
+CANVAS_HEIGHT = 250
+
+if "paint_canvas_array" not in st.session_state:
+    st.session_state.paint_canvas_array = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH), dtype=np.uint8)
+
+
+def _row_to_frequency(row: int, sr: int, canvas_height: int = CANVAS_HEIGHT) -> float:
+    """Approximate frequency represented by a given canvas row (0 = top =
+    high frequency, canvas_height = bottom = 0 Hz), matching the mapping
+    image_to_audio() uses after flipping the image vertically."""
+    return (1.0 - row / canvas_height) * (sr / 2.0)
+
+
+def _frequency_to_row(freq_hz: float, sr: int, canvas_height: int = CANVAS_HEIGHT) -> int:
+    row = canvas_height * (1.0 - freq_hz / (sr / 2.0))
+    return int(max(0, min(canvas_height - 1, row)))
+
+
+def _draw_plain_stroke(arr: np.ndarray, x1, y1, x2, y2, stroke_width: int, brightness: int):
+    img = Image.fromarray(arr, mode="L")
+    draw = ImageDraw.Draw(img)
+    draw.line([(x1, y1), (x2, y2)], fill=brightness, width=stroke_width)
+    if brightness > 0:
+        # round the ends of the stroke so single clicks (x1==x2, y1==y2) show up
+        r = stroke_width / 2
+        draw.ellipse([x1 - r, y1 - r, x1 + r, y1 + r], fill=brightness)
+        draw.ellipse([x2 - r, y2 - r, x2 + r, y2 + r], fill=brightness)
+    return np.array(img)
+
+
+def _draw_harmonic_stack_stroke(
+        arr: np.ndarray, x1, y1, x2, y2, stroke_width: int, sr: int,
+        n_harmonics: int = 5, decay: float = 0.6,
+):
+    """Draws the fundamental stroke plus fainter strokes at integer multiples
+    of the implied frequency above it - approximates an instrument-like
+    harmonic series instead of a pure tone."""
+    img = Image.fromarray(arr, mode="L")
+    draw = ImageDraw.Draw(img)
+
+    # Sample a few points along the stroke, compute the fundamental frequency
+    # at each, then draw the harmonic rows for each sampled x position.
+    n_samples = max(2, int(abs(x2 - x1)) + 1)
+    for t in np.linspace(0, 1, n_samples):
+        x = x1 + (x2 - x1) * t
+        y = y1 + (y2 - y1) * t
+        f0 = _row_to_frequency(y, sr)
+        if f0 <= 0:
+            continue
+        for k in range(1, n_harmonics + 1):
+            harmonic_freq = f0 * k
+            if harmonic_freq >= sr / 2:
+                break
+            row_k = _frequency_to_row(harmonic_freq, sr)
+            brightness_k = int(255 * (decay ** (k - 1)))
+            half_w = max(1, stroke_width // 2)
+            draw.line(
+                [(x, row_k - half_w / 2), (x, row_k + half_w / 2)],
+                fill=brightness_k, width=max(1, stroke_width // 2),
+            )
+    return np.array(img)
+
+
 with tab_paint:
     st.caption(
         "Draw directly on a blank spectrogram: horizontal axis = time, "
         "vertical axis = frequency (high at the top, low at the bottom), "
-        "brightness = loudness. White strokes = sound, black erases it."
+        "brightness = loudness."
     )
 
     st.subheader("Parameters")
@@ -397,38 +558,76 @@ with tab_paint:
         )
 
     st.subheader("Canvas")
-    tool_col, width_col = st.columns(2)
+    tool_col, shape_col, width_col = st.columns(3)
     with tool_col:
-        tool = st.radio("Tool", ["Brush", "Eraser"], horizontal=True, key="paint_tool")
+        tool = st.radio("Tool", ["Brush", "Eraser"], key="paint_tool")
+    with shape_col:
+        pen_shape = st.radio(
+            "Pen shape", ["Plain line", "Harmonic stack"], key="paint_pen_shape",
+            help=(
+                "Plain line: draws exactly what you drag - good for pure "
+                "tones and sweeps. Harmonic stack: also adds fainter lines "
+                "at integer multiples of the frequency you draw, so it "
+                "sounds more like an instrument playing a note than a pure "
+                "sine tone."
+            ),
+        )
     with width_col:
         stroke_width = st.slider("Stroke width", 1, 30, 8, key="paint_stroke_width")
 
-    # Brush paints white (= loud), eraser paints black (= silent) - simplest
-    # way to support erasing without needing a separate transparency layer.
-    stroke_color = "#FFFFFF" if tool == "Brush" else "#000000"
-
-    canvas_result = st_canvas(
-        fill_color="#000000",
-        stroke_width=stroke_width,
-        stroke_color=stroke_color,
-        background_color="#000000",
-        height=300,
-        width=600,
-        drawing_mode="freedraw",
-        display_toolbar=True,
-        key="paint_canvas",
+    st.caption(
+        "Click and drag on the canvas below to draw a stroke. Each drag adds "
+        "one stroke; keep dragging to build up the picture."
     )
 
+    canvas_image = Image.fromarray(st.session_state.paint_canvas_array, mode="L")
+    coords = streamlit_image_coordinates(
+        canvas_image,
+        key="paint_canvas_widget",
+        click_and_drag=True,
+        width=CANVAS_WIDTH,
+    )
+
+    if coords is not None:
+        # Scale from the coordinates reported by the browser (which may
+        # differ from CANVAS_WIDTH/HEIGHT if the image was displayed at a
+        # different size) back to the underlying array's pixel space.
+        scale_x = CANVAS_WIDTH / max(coords.get("width", CANVAS_WIDTH), 1)
+        scale_y = CANVAS_HEIGHT / max(coords.get("height", CANVAS_HEIGHT), 1)
+        x1 = coords["x1"] * scale_x
+        y1 = coords["y1"] * scale_y
+        x2 = coords["x2"] * scale_x
+        y2 = coords["y2"] * scale_y
+
+        stroke_id = coords.get("unix_time")
+        if st.session_state.get("paint_last_stroke") != stroke_id:
+            st.session_state.paint_last_stroke = stroke_id
+
+            if tool == "Eraser":
+                st.session_state.paint_canvas_array = _draw_plain_stroke(
+                    st.session_state.paint_canvas_array, x1, y1, x2, y2, stroke_width, brightness=0
+                )
+            elif pen_shape == "Plain line":
+                st.session_state.paint_canvas_array = _draw_plain_stroke(
+                    st.session_state.paint_canvas_array, x1, y1, x2, y2, stroke_width, brightness=255
+                )
+            else:
+                st.session_state.paint_canvas_array = _draw_harmonic_stack_stroke(
+                    st.session_state.paint_canvas_array, x1, y1, x2, y2, stroke_width, sr=SAMPLE_RATE
+                )
+            st.rerun()
+
+    if st.button("Clear canvas", key="paint_clear"):
+        st.session_state.paint_canvas_array = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH), dtype=np.uint8)
+        st.rerun()
+
     if st.button("Generate Audio from Painting", type="primary", key="paint_generate"):
-        if canvas_result.image_data is None or not np.any(canvas_result.image_data[:, :, :3]):
+        if not np.any(st.session_state.paint_canvas_array):
             st.warning("The canvas is empty - draw something first.")
         else:
             with st.spinner("Running Griffin-Lim reconstruction..."):
-                # Canvas gives RGBA; drop alpha and convert to grayscale.
-                rgb = canvas_result.image_data[:, :, :3].astype(np.uint8)
-                gray = Image.fromarray(rgb, mode="RGB").convert("L")
                 painted_image_path = os.path.join(tmp_dir, "painted_spectrogram.png")
-                gray.save(painted_image_path)
+                Image.fromarray(st.session_state.paint_canvas_array, mode="L").save(painted_image_path)
 
                 audio, out_sr = image_to_audio(
                     painted_image_path,
@@ -450,3 +649,5 @@ with tab_paint:
                     file_name="painted_reconstruction.wav",
                     key="paint_download",
                 )
+
+            show_round_trip_comparison(painted_image_path, out_audio_path, paint_n_fft)
